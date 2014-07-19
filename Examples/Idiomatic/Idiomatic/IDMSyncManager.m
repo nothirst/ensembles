@@ -14,7 +14,8 @@
 #import "CDEDropboxCloudFileSystem.h"
 #import "CDENodeCloudFileSystem.h"
 #import "IDMNodeSyncSettingsViewController.h"
-
+#import "CDEMultipeerCloudFileSystem.h"
+#import "IDMMultipeerManager.h"
 
 NSString * const IDMSyncActivityDidBeginNotification = @"IDMSyncActivityDidBegin";
 NSString * const IDMSyncActivityDidEndNotification = @"IDMSyncActivityDidEnd";
@@ -23,6 +24,7 @@ NSString * const IDMCloudServiceUserDefaultKey = @"IDMCloudServiceUserDefaultKey
 NSString * const IDMICloudService = @"icloud";
 NSString * const IDMDropboxService = @"dropbox";
 NSString * const IDMNodeS3Service = @"node";
+NSString * const IDMMultipeerService = @"multipeer";
 
 NSString * const IDMNodeS3EmailDefaultKey = @"IDMNodeS3EmailDefaultKey";
 
@@ -41,6 +43,7 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
     CDECompletionBlock dropboxLinkSessionCompletion;
     CDECompletionBlock nodeCredentialUpdateCompletion;
     DBSession *dropboxSession;
+    IDMMultipeerManager *multipeerManager;
 }
 
 @synthesize ensemble = ensemble;
@@ -75,11 +78,18 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
 
 - (void)reset
 {
+    [multipeerManager stop];
+    [multipeerManager.multipeerCloudFileSystem removeAllFiles];
+    multipeerManager = nil;
+
     [self clearNodePassword];
+    
     [dropboxSession unlinkAll];
     dropboxSession = nil;
+    
     ensemble.delegate = nil;
     ensemble = nil;
+    
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:IDMCloudServiceUserDefaultKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
@@ -107,10 +117,10 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
 - (void)setupEnsemble
 {
     if (!self.canSynchronize) return;
-    
+
     cloudFileSystem = [self makeCloudFileSystem];
     if (!cloudFileSystem) return;
-    
+
     NSURL *storeURL = [NSURL fileURLWithPath:storePath];
     NSURL *modelURL = [[NSBundle mainBundle] URLForResource:@"Model" withExtension:@"momd"];
     ensemble = [[CDEPersistentStoreEnsemble alloc] initWithEnsembleIdentifier:@"MainStore" persistentStoreURL:storeURL managedObjectModelURL:modelURL cloudFileSystem:cloudFileSystem];
@@ -141,6 +151,20 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
         newNodeFileSystem.password = password;
         newSystem = newNodeFileSystem;
     }
+    else if ([cloudService isEqualToString:IDMMultipeerService]) {
+        multipeerManager = [[IDMMultipeerManager alloc] init];
+
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+        NSString *path = [paths.lastObject stringByAppendingPathComponent:@"Idiomatic/Multipeer"];
+        CDEMultipeerCloudFileSystem *multipeerCloudFileSystem = [[CDEMultipeerCloudFileSystem alloc] initWithRootDirectory:path multipeerConnection:multipeerManager];
+        multipeerManager.multipeerCloudFileSystem = multipeerCloudFileSystem;
+        [multipeerManager start];
+        
+        newSystem = multipeerCloudFileSystem;
+
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(didImportFiles) name:CDEMultipeerCloudFileSystemDidImportFilesNotification object:nil];
+    }
+    
     return newSystem;
 }
 
@@ -160,7 +184,7 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
 - (void)synchronizeWithCompletion:(CDECompletionBlock)completion
 {
     if (!self.canSynchronize) return;
-    
+
     [self incrementMergeCount];
     if (!ensemble.isLeeched) {
         [ensemble leechPersistentStoreWithCompletion:^(NSError *error) {
@@ -179,6 +203,7 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
     else {
         [ensemble mergeWithCompletion:^(NSError *error) {
             [self decrementMergeCount];
+            [multipeerManager syncFilesWithAllPeers];
             if (error) NSLog(@"Error merging: %@", error);
             if (completion) completion(error);
         }];
@@ -265,7 +290,7 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
     UINavigationController *nodeSettingsNavController = [storyboard instantiateViewControllerWithIdentifier:@"NodeSettingsNavigationController"];
     IDMNodeSyncSettingsViewController *settingsController = (id)nodeSettingsNavController.topViewController;
     settingsController.nodeFileSystem = fileSystem;
-    
+
     [window.rootViewController presentViewController:nodeSettingsNavController animated:YES completion:NULL];
 }
 
@@ -287,7 +312,7 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
         NSDictionary *info = @{NSLocalizedDescriptionKey : @"Invalid username or password"};
         error = [NSError errorWithDomain:CDEErrorDomain code:CDEErrorCodeAuthenticationFailure userInfo:info];
     }
-    
+
     if (nodeCredentialUpdateCompletion) nodeCredentialUpdateCompletion(error);
     nodeCredentialUpdateCompletion = NULL;
 }
@@ -304,11 +329,11 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
 - (NSDictionary *)keychainQuery {
     NSString *serviceName = @"com.mentalfaculty.ensembles.idiosync";
     return @{
-        (__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService : serviceName,
-        (__bridge id)kSecAttrAccount : serviceName,
-        (__bridge id)kSecAttrAccessible : (__bridge id)kSecAttrAccessibleAlways
-    };
+             (__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword,
+             (__bridge id)kSecAttrService : serviceName,
+             (__bridge id)kSecAttrAccount : serviceName,
+             (__bridge id)kSecAttrAccessible : (__bridge id)kSecAttrAccessibleAlways
+             };
 }
 
 - (void)storeNodePassword:(NSString *)newPassword
@@ -324,14 +349,14 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
     NSMutableDictionary *keychainQuery = [[self keychainQuery] mutableCopy];
     keychainQuery[(__bridge id)kSecReturnData] = @YES;
     keychainQuery[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
-    
+
     NSString *result = nil;
     CFDataRef data = NULL;
     if (noErr == SecItemCopyMatching((__bridge CFDictionaryRef)keychainQuery, (CFTypeRef *)&data)) {
         result = [[NSString alloc] initWithData:(__bridge id)data encoding:NSUTF8StringEncoding];
     }
     if (data) CFRelease(data);
-    
+
     return result;
 }
 
@@ -339,6 +364,13 @@ NSString * const IDMDropboxAppSecret = @"djibc9zfvppronm";
 {
     NSDictionary *keychainQuery = [self keychainQuery];
     SecItemDelete((__bridge CFDictionaryRef)keychainQuery);
+}
+
+#pragma mark - CDEMultipeerCloudFileSystem
+
+- (void)didImportFiles
+{
+    [self synchronizeWithCompletion:nil];
 }
 
 @end
